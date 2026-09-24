@@ -191,6 +191,9 @@ jobs:
               tag = item[0]
               return (tag.endswith("_linux"), tag)
 
+          # Bottle JSON cellar is like ":any" / ":any_skip_relocation" / "/opt/homebrew/Cellar".
+          if cellar and not cellar.startswith(":") and not cellar.startswith('"'):
+              cellar = f":{cellar}" if cellar in {"any", "any_skip_relocation"} else f'"{cellar}"'
           cellar_cell = f"cellar: {cellar}, " if cellar else ""
           lines = ["  bottle do", f'    root_url "{root_url}"']
           width = max(len(t) for t in tags)
