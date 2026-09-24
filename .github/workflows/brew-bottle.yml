@@ -83,8 +83,8 @@ jobs:
       fail-fast: false
       matrix:
         os:
+          # Homebrew Tier 3 (e.g. macOS 14) no longer produces bottles.
           - macos-15
-          - macos-14
           - ubuntu-24.04
           - ubuntu-22.04
     steps:
@@ -101,9 +101,6 @@ jobs:
         id: set-up-homebrew
         uses: Homebrew/actions/setup-homebrew@main
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Build and bottle
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -112,8 +109,9 @@ jobs:
           set -euo pipefail
           brew tap "${TAP_USER}/${TAP_REPO}" "$GITHUB_WORKSPACE"
           brew trust --formula "${TAP_USER}/${TAP_REPO}/${FORMULA}"
-          # rustup already provides cargo; skip brew's rust build dependency.
-          brew install --build-bottle --ignore-dependencies "${TAP_USER}/${TAP_REPO}/${FORMULA}"
+          # Brew's own rust keeps cargo inside the formula superenv.
+          brew install rust
+          brew install --build-bottle "${TAP_USER}/${TAP_REPO}/${FORMULA}"
           brew test "${TAP_USER}/${TAP_REPO}/${FORMULA}"
           # brew bottle writes into the current directory (no --output-dir).
           brew bottle \
