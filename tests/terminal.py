@@ -34,7 +34,7 @@ class Controller(http.server.BaseHTTPRequestHandler):
             }}
         elif "/delay?" in self.path:
             name = unquote(self.path.split("/")[2])
-            pause, delay = {"香港一": (0.4, 123), "香港二": (1.5, 401), "香港三": (2, 0), "香港四": (2.5, 250), "香港五": (4, 300), "香港六": (0.3, 60)}[name]
+            pause, delay = {"香港一": (0.4, 123), "香港二": (1.5, 401), "香港三": (2, 1001), "香港四": (2.5, 250), "香港五": (4, 300), "香港六": (0.3, 60)}[name]
             time.sleep(pause)
             body = {"delay": delay}
         else:

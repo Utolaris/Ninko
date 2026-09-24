@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 use console::style;
 mod platform;
@@ -9,27 +9,46 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, Method, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::IsTerminal, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap, io::IsTerminal, path::PathBuf, process::ExitCode, time::Duration,
+};
 
+/// Human UI: run `ninko` with no args (Chinese TUI).
+/// Agent CLI: subcommands print a single JSON object on stdout (English help).
 #[derive(Parser)]
 #[command(
-    name = "Ninko",
+    name = "ninko",
     bin_name = "ninko",
     version,
-    about = "Clash Verge 节点管理（需要已运行的 Clash Verge）"
+    about = "Clash Verge controller. Never switch nodes or stop/restart the app unless the user explicitly authorizes it.",
+    long_about = "Clash Verge controller.\n\n\
+Permission boundary: Never switch nodes or stop/restart Clash Verge unless the user explicitly authorizes that action.\n\
+\n\
+Audience:\n\
+  - `ninko` (no args, TTY): interactive Chinese menu for humans.\n\
+  - `ninko <command>`: machine-readable JSON on stdout for LLM/agents.\n\
+\n\
+Agent workflow (LLM):\n\
+  1. ALWAYS run `ninko test` first — every node gets a stable `index` (1-based).\n\
+  2. Pick a node from `passed` (or inspect `failed`).\n\
+  3. Switch with that index: `ninko switch <index>` or `ninko switch <group> <index>`.\n\
+     Full node names still work: `ninko switch <group> '<node name>'`.\n\
+\n\
+JSON envelope: success objects include `\"ok\": true` (except `list`/`test` payloads);\n\
+errors are `{\"ok\": false, \"error\": \"...\"}` with exit code 1.\n\
+Requires Clash Verge Rev installed and running (core reachable via Unix socket or HTTP)."
 )]
 struct Cli {
+    /// Clash Verge data directory (overrides auto-discovery)
     #[arg(long, env = "CLASH_DATA_DIR", global = true)]
     data_dir: Option<PathBuf>,
+    /// Explicit Unix socket path to mihomo external controller
     #[arg(long, env = "CLASH_SOCK", global = true)]
     sock: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "CLASH_API",
-        global = true,
-        help = "显式指定 HTTP 控制器，优先于默认 socket"
-    )]
+    /// Explicit HTTP controller URL (takes priority over auto socket discovery)
+    #[arg(long, env = "CLASH_API", global = true)]
     api: Option<String>,
+    /// Controller secret (Bearer token)
     #[arg(long, env = "CLASH_SECRET", global = true, hide_env_values = true)]
     secret: Option<String>,
     #[command(subcommand)]
@@ -38,33 +57,53 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 列出当前 Profile、已加载订阅及完整节点列表
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// 并发测试运行节点的延迟（毫秒），不是下载带宽
+    /// Print current profile, providers, groups, and nodes as JSON
+    List,
+    /// Measure node latency. Stdout: {"passed":[...],"failed":[...]} — each node has `index`
     Test {
+        /// Limit to one provider
         #[arg(long, conflicts_with = "group")]
         provider: Option<String>,
+        /// Limit to one policy group (expands nested groups)
         #[arg(long)]
         group: Option<String>,
+        /// Probe URL
         #[arg(long, default_value = "https://www.gstatic.com/generate_204")]
         url: String,
+        /// Per-node timeout in milliseconds
         #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1..=120000))]
         timeout: u64,
+        /// Concurrent probes
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
         concurrency: u16,
-        #[arg(long)]
-        json: bool,
     },
-    /// 快速切换：省略参数时使用可搜索菜单
+    /// Switch selection. Prefer `ninko switch <index>` after `ninko test` (index from that run)
     Switch {
+        /// Policy group name, or a bare test `index` (digits) to resolve group+node
         group: Option<String>,
+        /// Node full name, or a test `index` (digits) from the last `ninko test`
         node: Option<String>,
     },
-    /// 输出全局扩展 Merge YAML 的绝对路径
+    /// Restart or stop the Clash Verge desktop app
+    Control { action: ControlAction },
+    /// Print absolute path of the global Merge YAML as JSON {"path":"..."}
     MergePath,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ControlAction {
+    /// Restart the Clash Verge app
+    Restart,
+    /// Stop / quit the Clash Verge app
+    Stop,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Audience {
+    /// Interactive Chinese TUI
+    Human,
+    /// JSON on stdout for agents
+    Agent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +129,7 @@ fn profiles(dir: &std::path::Path) -> Result<Profiles> {
     let path = dir.join("profiles.yaml");
     serde_yaml::from_str(&std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "找不到 Clash Verge 配置 {}，请检查安装或 --data-dir",
+            "找不到 Clash Verge 配置 {}，请确认已安装并运行过 Clash Verge Rev，或用 --data-dir 指定数据目录",
             path.display()
         )
     })?)
@@ -121,11 +160,29 @@ impl Api {
             .no_proxy()
             .timeout(Duration::from_secs(130));
         let dir = data_dir(cli)?;
-        let config = if cli.api.is_none() {
+        let mut config = if cli.api.is_none() {
             platform::controller(&dir)?
         } else {
             platform::Controller::default()
         };
+        let running_core = if cli.api.is_none() && cli.sock.is_none() {
+            platform::running_cores()
+                .into_iter()
+                .find(|core| platform::usable_socket(&core.socket))
+        } else {
+            None
+        };
+        if let Some(core) = &running_core {
+            if let Some(path) = &core.config
+                && let Ok(runtime_config) = platform::controller_file(path)
+            {
+                config.address = runtime_config.address.or(config.address);
+                config.secret = runtime_config.secret.or(config.secret);
+            }
+            // The live core arguments are authoritative. Clash Verge Rev 2.5.5
+            // service mode keeps its socket under /var/run, outside app data.
+            config.socket = Some(core.socket.clone());
+        }
         let sock = cli.sock.clone().or_else(|| {
             if cli.api.is_some() {
                 return None;
@@ -142,7 +199,7 @@ impl Api {
             #[cfg(not(unix))]
             {
                 let _ = sock;
-                bail!("本平台不支持 Unix socket，请使用 --api");
+                bail!("Unix sockets are not supported on this platform; use --api");
             }
             Url::parse("http://localhost")?
         } else {
@@ -152,13 +209,29 @@ impl Api {
         };
         ensure!(
             matches!(base.scheme(), "http" | "https"),
-            "控制器必须使用 HTTP/HTTPS"
+            "controller URL must be http/https"
         );
         Ok(Self {
             client: builder.build()?,
             base,
             secret: cli.secret.clone().or(config.secret),
         })
+    }
+    async fn reachable(&self) -> bool {
+        let mut url = self.base.clone();
+        if let Ok(mut segments) = url.path_segments_mut() {
+            segments.clear().extend(["version"]);
+        } else {
+            return false;
+        }
+        let request = self.client.get(url);
+        let request = if let Some(secret) = &self.secret {
+            request.bearer_auth(secret)
+        } else {
+            request
+        };
+        // Any HTTP response proves the core is listening, including 401/404.
+        request.send().await.is_ok()
     }
     async fn call(
         &self,
@@ -169,7 +242,7 @@ impl Api {
     ) -> Result<Value> {
         let mut url = self.base.clone();
         url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("无效控制器地址"))?
+            .map_err(|_| anyhow::anyhow!("invalid controller URL"))?
             .clear()
             .extend(parts);
         if !query.is_empty() {
@@ -187,16 +260,21 @@ impl Api {
             .send()
             .await
             .map_err(|e| e.without_url())
-            .context("无法连接 Clash Verge；请确认应用已运行及控制器地址正确")?;
+            .context(
+                "cannot reach Clash Verge controller; is the app running, and are socket/API/secret correct?",
+            )?;
         let status = response.status();
         if matches!(status.as_u16(), 503 | 504) {
-            bail!("节点不可达或测速超时（HTTP {}）", status.as_u16());
+            bail!(
+                "upstream unreachable or probe timeout (HTTP {})",
+                status.as_u16()
+            );
         }
         if !status.is_success() {
             bail!(
-                "Clash Verge API 返回 {status}{}",
+                "Clash Verge API returned {status}{}",
                 if status.as_u16() == 401 {
-                    "，请设置 CLASH_SECRET"
+                    " — set CLASH_SECRET"
                 } else {
                     ""
                 }
@@ -205,7 +283,14 @@ impl Api {
         if status.as_u16() == 204 {
             return Ok(Value::Null);
         }
-        response.json().await.context("Clash Verge 返回无效 JSON")
+        let bytes = response
+            .bytes()
+            .await
+            .context("Clash Verge returned an empty body")?;
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&bytes).context("Clash Verge returned invalid JSON")
     }
     async fn get(&self, parts: &[&str]) -> Result<Value> {
         self.call(Method::GET, parts, &[], None).await
@@ -247,7 +332,6 @@ impl Runtime {
         let providers = api.get(&["providers", "proxies"]).await?;
         let proxies = api.get(&["proxies"]).await?;
         let mut providers: ProviderResponse = serde_json::from_value(providers)?;
-        // Compatible 是核心合成的集合，不能当作真正订阅重复展示。
         providers
             .providers
             .retain(|_, p| p.vehicle_type != "Compatible");
@@ -266,7 +350,7 @@ impl Runtime {
         if let Some(name) = provider {
             ensure!(
                 self.providers.contains_key(name),
-                "找不到运行中的订阅：{name}"
+                "provider not loaded: {name}"
             );
         }
         for (name, p) in &self.providers {
@@ -305,7 +389,7 @@ impl Runtime {
         let node = self
             .proxies
             .get(name)
-            .with_context(|| format!("找不到节点或策略组：{name}"))?;
+            .with_context(|| format!("node or group not found: {name}"))?;
         if let Some(members) = &node.all {
             for member in members {
                 self.expand(member, visited, result)?;
@@ -325,6 +409,11 @@ fn testable(node: &Node) -> bool {
             node.kind.to_ascii_uppercase().as_str(),
             "DIRECT" | "REJECT" | "REJECTDROP" | "PASS" | "COMPATIBLE"
         )
+}
+
+/// mihomo synthesizes GLOBAL; only user-defined Selector groups are real.
+fn is_real_group(name: &str, node: &Node) -> bool {
+    node.kind == "Selector" && !name.eq_ignore_ascii_case("GLOBAL")
 }
 
 #[derive(Clone, Serialize)]
@@ -356,8 +445,8 @@ async fn measure(api: &Api, target: Target, url: &str, timeout: u64) -> Measurem
         .and_then(|v| {
             v["delay"]
                 .as_u64()
-                .filter(|d| *d > 0)
-                .context("超时或无有效延迟")
+                .filter(|d| (1..=1000).contains(d))
+                .context("timeout: delay exceeds 1000 ms or no valid delay")
         });
     match result {
         Ok(delay) => Measurement {
@@ -374,13 +463,21 @@ async fn measure(api: &Api, target: Target, url: &str, timeout: u64) -> Measurem
 }
 
 async fn choose(prompt: &str, items: &[String], default: usize) -> Result<Option<String>> {
-    ensure!(!items.is_empty(), "{prompt}：没有可选项");
+    ensure!(!items.is_empty(), "{prompt}: no options");
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-        "非交互终端请指定完整命令：ninko switch <策略组> <节点>"
+        "interactive picker needs a TTY; use: ninko switch <group> <node>"
     );
     let selection = terminal::select(prompt, items, default, true, None).await?;
     Ok(selection.map(|i| items[i].clone()))
+}
+
+fn result_line(ok: bool, text: &str) -> String {
+    if ok {
+        format!("  {} {text}", style("✓").green().bold())
+    } else {
+        format!("  {} {text}", style("✗").red().bold())
+    }
 }
 
 async fn switch(
@@ -388,24 +485,45 @@ async fn switch(
     runtime: &Runtime,
     group: Option<String>,
     node: Option<String>,
-    interactive: bool,
-) -> Result<()> {
+    audience: Audience,
+) -> Result<Value> {
+    // Agent shortcut: `ninko switch <index>` — index from the last `ninko test`.
+    let (group, node) = match (group, node) {
+        (Some(g), None) if g.chars().all(|c| c.is_ascii_digit()) && !g.is_empty() => {
+            let index: u32 = g.parse().context("test index out of range")?;
+            let (resolved_group, name) = resolve_test_index(index, None)?;
+            ensure!(
+                resolved_group.is_some(),
+                "test index {index} has no group; run `ninko test --group <name>` or pass the group: ninko switch <group> {index}"
+            );
+            (resolved_group, Some(name))
+        }
+        (Some(g), Some(n)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => {
+            let index: u32 = n.parse().context("test index out of range")?;
+            let (_, name) = resolve_test_index(index, Some(&g))?;
+            (Some(g), Some(name))
+        }
+        (group, node) => (group, node),
+    };
     let groups: Vec<_> = runtime
         .proxies
         .iter()
-        .filter(|(_, n)| n.kind == "Selector")
+        .filter(|(name, n)| is_real_group(name, n))
         .map(|(name, _)| name.clone())
         .collect();
     let group = match group {
         Some(g) => g,
-        None => match choose("选择策略组（输入可搜索）", &groups, 0).await? {
+        None => match choose("选择策略组", &groups, 0).await? {
             Some(group) => group,
-            None => return Ok(()),
+            None => return Ok(json!({"ok": false, "cancelled": true})),
         },
     };
-    let info = runtime.proxies.get(&group).context("找不到策略组")?;
-    ensure!(info.kind == "Selector", "只支持手动选择策略组 Selector");
-    let members = info.all.as_ref().context("策略组没有成员列表")?;
+    let info = runtime.proxies.get(&group).context("group not found")?;
+    ensure!(
+        info.kind == "Selector",
+        "only Selector groups are supported"
+    );
+    let members = info.all.as_ref().context("group has no members")?;
     let node = match node {
         Some(n) => n,
         None => {
@@ -421,7 +539,7 @@ async fn switch(
                 .collect();
             ensure!(
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-                "非交互终端请指定完整命令：ninko switch <策略组> <节点>"
+                "interactive picker needs a TTY; use: ninko switch <group> <node>"
             );
             let delays = stream::iter(members.iter().enumerate())
                 .map(|(index, name)| async move {
@@ -438,7 +556,7 @@ async fn switch(
                 })
                 .buffer_unordered(8);
             let selected = terminal::select_live(
-                &format!("{group} · 输入搜索 / ↑↓ 选择 / Enter 确定 / Esc 返回"),
+                &group,
                 &labels,
                 members.iter().position(|n| Some(n) == info.now.as_ref()),
                 delays,
@@ -446,11 +564,14 @@ async fn switch(
             .await?;
             match selected {
                 Some(index) => members[index].clone(),
-                None => return Ok(()),
+                None => return Ok(json!({"ok": false, "cancelled": true})),
             }
         }
     };
-    ensure!(members.contains(&node), "节点 {node} 不属于策略组 {group}");
+    ensure!(
+        members.contains(&node),
+        "node {node} is not in group {group}"
+    );
     api.call(
         Method::PUT,
         &["proxies", &group],
@@ -461,37 +582,368 @@ async fn switch(
     let updated = api.get(&["proxies", &group]).await?;
     ensure!(
         updated["now"].as_str() == Some(&node),
-        "切换请求已发送，但读回结果不一致，请检查 Clash Verge"
+        "switch sent but readback mismatch; check Clash Verge"
     );
-    let line = format!(
-        "  {} {group} → {}",
-        style("✓ 已切换").green().bold(),
-        style(node).bold()
-    );
-    if interactive {
-        // 提示只出现在节点切换界面，离开时清除，不带回主菜单
-        terminal::show_result(&[line])?;
-    } else {
-        println!("\n{line}\n");
+    let payload = json!({"ok": true, "group": group, "node": node});
+    if audience == Audience::Human {
+        terminal::show_result(&[result_line(
+            true,
+            &format!("{group} → {}", style(&node).bold()),
+        )])?;
     }
+    Ok(payload)
+}
+
+async fn wait_for_controller(cli: &Cli) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(api) = Api::new(cli) {
+            let reachable = tokio::time::timeout(Duration::from_millis(500), api.reachable())
+                .await
+                .unwrap_or(false);
+            if reachable {
+                return Ok(());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "Clash Verge restarted, but its controller did not become reachable within 30 seconds"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn control_command(cli: &Cli, action: ControlAction, audience: Audience) -> Result<Value> {
+    let payload = match action {
+        ControlAction::Stop => {
+            let stopped = platform::stop_clash_verge().context("failed to stop Clash Verge")?;
+            json!({"ok": true, "action": "stop", "signaled": stopped})
+        }
+        ControlAction::Restart => {
+            let stopped =
+                platform::restart_clash_verge().context("failed to restart Clash Verge")?;
+            wait_for_controller(cli).await?;
+            json!({"ok": true, "action": "restart", "signaled": stopped})
+        }
+    };
+    if audience == Audience::Human {
+        let text = match action {
+            ControlAction::Stop => "Clash Verge 已退出",
+            ControlAction::Restart => "Clash Verge 已重启",
+        };
+        terminal::show_result(&[result_line(true, text)])?;
+    }
+    Ok(payload)
+}
+
+fn list_json(runtime: &Runtime, current: Option<&Profile>) -> Value {
+    let groups: BTreeMap<_, _> = runtime
+        .proxies
+        .iter()
+        .filter(|(name, n)| n.all.is_some() && is_real_group(name, n))
+        .collect();
+    let inline: Vec<_> = runtime
+        .proxies
+        .values()
+        .filter(|n| {
+            testable(n)
+                && !runtime
+                    .providers
+                    .values()
+                    .any(|p| p.proxies.iter().any(|pn| pn.name == n.name))
+        })
+        .collect();
+    json!({
+        "ok": true,
+        "current_profile": current,
+        "groups": groups,
+        "providers": runtime.providers,
+        "inline_nodes": inline,
+    })
+}
+
+fn print_list_human(runtime: &Runtime, current: Option<&Profile>) {
+    if let Some(p) = current {
+        println!(
+            "当前 Profile：{} [{}]",
+            p.name.as_deref().unwrap_or(&p.uid),
+            p.kind
+        );
+    }
+    println!("\n  {}", style("当前策略组").cyan().bold());
+    let mut selections = table(&["策略组", "当前节点"]);
+    for (name, n) in runtime
+        .proxies
+        .iter()
+        .filter(|(name, n)| n.all.is_some() && is_real_group(name, n))
+    {
+        selections.add_row([name.as_str(), n.now.as_deref().unwrap_or("无固定选择")]);
+    }
+    println!("{selections}");
+    for (name, p) in &runtime.providers {
+        println!(
+            "\n订阅：{name} [{}] — {} 个节点",
+            p.vehicle_type,
+            p.proxies.len()
+        );
+        print_nodes(p.proxies.iter(), runtime);
+    }
+    let inline: Vec<_> = runtime
+        .proxies
+        .values()
+        .filter(|n| {
+            testable(n)
+                && !runtime
+                    .providers
+                    .values()
+                    .any(|p| p.proxies.iter().any(|pn| pn.name == n.name))
+        })
+        .collect();
+    if !inline.is_empty() {
+        println!("\n运行配置内置节点：");
+        print_nodes(inline.into_iter(), runtime);
+    }
+}
+
+fn test_groups(results: &[Measurement], group: Option<&str>) -> Value {
+    let mut passed = Vec::new();
+    let mut failed = Vec::new();
+    // 1-based index across the whole run (passed first after sort, then failed).
+    let mut index = 0u32;
+    let mut cache = Vec::new();
+    for r in results {
+        index += 1;
+        let provider = r.target.provider.clone();
+        let name = r.target.name.clone();
+        if r.delay_ms.is_some() {
+            passed.push(json!({
+                "index": index,
+                "provider": provider,
+                "name": name,
+                "delay_ms": r.delay_ms,
+                "group": group,
+            }));
+        } else {
+            failed.push(json!({
+                "index": index,
+                "provider": provider,
+                "name": name,
+                "error": r.error.clone().unwrap_or_else(|| "unknown".into()),
+                "group": group,
+            }));
+        }
+        cache.push(json!({
+            "index": index,
+            "provider": r.target.provider,
+            "name": r.target.name,
+            "delay_ms": r.delay_ms,
+            "error": r.error,
+            "group": group,
+        }));
+    }
+    let _ = save_last_test(&cache);
+    json!({"ok": true, "passed": passed, "failed": failed})
+}
+
+fn last_test_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("NINKO_STATE_DIR") {
+        return PathBuf::from(dir).join("last-test.json");
+    }
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ninko")
+        .join("last-test.json")
+}
+
+fn save_last_test(entries: &[Value]) -> Result<()> {
+    let path = last_test_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!({"entries": entries}))?,
+    )?;
     Ok(())
 }
 
+fn load_last_test() -> Result<Vec<Value>> {
+    let path = last_test_path();
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no last test cache at {}; run `ninko test` first",
+            path.display()
+        )
+    })?;
+    let doc: Value =
+        serde_json::from_str(&text).context("last-test.json is corrupt; re-run `ninko test`")?;
+    Ok(doc["entries"].as_array().cloned().unwrap_or_default())
+}
+
+/// Resolve a test `index` (digits) to (group, node name). `hint_group` wins when set.
+fn resolve_test_index(index: u32, hint_group: Option<&str>) -> Result<(Option<String>, String)> {
+    let entries = load_last_test()?;
+    let hit = entries
+        .iter()
+        .find(|e| e["index"].as_u64() == Some(u64::from(index)))
+        .with_context(|| format!("test index {index} not in last test; run `ninko test` again"))?;
+    let name = hit["name"]
+        .as_str()
+        .context("test entry has no name")?
+        .to_owned();
+    let group = hint_group
+        .map(str::to_owned)
+        .or_else(|| hit["group"].as_str().map(str::to_owned));
+    Ok((group, name))
+}
+
+async fn execute(cli: &Cli, command: Command, audience: Audience) -> Result<Value> {
+    if matches!(command, Command::MergePath) {
+        let dir = data_dir(cli)?;
+        let path = merge_path(&dir, &profiles(&dir)?)?;
+        return Ok(json!({"ok": true, "path": path.display().to_string()}));
+    }
+    if let Command::Control { action } = command {
+        return control_command(cli, action, audience).await;
+    }
+    let api = Api::new(cli)?;
+    let runtime = Runtime::read(&api).await?;
+    match command {
+        Command::List => {
+            let metadata = profiles(&data_dir(cli)?)?;
+            let current = metadata
+                .items
+                .iter()
+                .find(|p| Some(&p.uid) == metadata.current.as_ref());
+            if audience == Audience::Agent {
+                Ok(list_json(&runtime, current))
+            } else {
+                print_list_human(&runtime, current);
+                Ok(Value::Null)
+            }
+        }
+        Command::Test {
+            provider,
+            group,
+            url,
+            timeout,
+            concurrency,
+        } => {
+            let test_url = Url::parse(&url).context("invalid probe URL")?;
+            ensure!(
+                matches!(test_url.scheme(), "http" | "https"),
+                "probe URL must be http/https"
+            );
+            let targets = runtime.targets(provider.as_deref(), group.as_deref())?;
+            ensure!(!targets.is_empty(), "no testable nodes");
+            if audience == Audience::Human {
+                eprintln!(
+                    "正在测试 {} 个节点，并发 {}，每个节点超时 {} ms…",
+                    targets.len(),
+                    concurrency,
+                    timeout
+                );
+            }
+            let progress = if audience == Audience::Human {
+                ProgressBar::new(targets.len() as u64)
+            } else {
+                ProgressBar::hidden()
+            };
+            progress.set_style(
+                ProgressStyle::with_template(
+                    "  {spinner:.cyan} [{bar:30.cyan/blue}] {pos}/{len} · {elapsed} · {msg}",
+                )?
+                .progress_chars("━━─"),
+            );
+            progress.enable_steady_tick(Duration::from_millis(100));
+            let mut results: Vec<_> = stream::iter(targets)
+                .map(|t| measure(&api, t, &url, timeout))
+                .buffer_unordered(concurrency as usize)
+                .inspect(|r| {
+                    progress.inc(1);
+                    progress.set_message(r.target.name.clone());
+                })
+                .collect()
+                .await;
+            progress.finish_and_clear();
+            results.sort_by_key(|r| r.delay_ms.unwrap_or(u64::MAX));
+            if audience == Audience::Agent {
+                Ok(test_groups(&results, group.as_deref()))
+            } else {
+                let passed = results.iter().filter(|r| r.delay_ms.is_some()).count();
+                println!(
+                    "\n  {}  {} 可用 / {} 失败 · 延迟由低到高",
+                    style("测速完成").green().bold(),
+                    passed,
+                    results.len() - passed
+                );
+                let mut rows = table(&["序号", "延迟", "订阅", "节点", "状态"]);
+                for (i, r) in results.iter().enumerate() {
+                    rows.add_row([
+                        (i + 1).to_string(),
+                        r.delay_ms.map(|d| format!("{d} ms")).unwrap_or("—".into()),
+                        r.target.provider.clone().unwrap_or("运行配置".into()),
+                        r.target.name.clone(),
+                        r.error.clone().unwrap_or("可用".into()),
+                    ]);
+                }
+                println!("{rows}");
+                let _ = test_groups(&results, group.as_deref());
+                Ok(Value::Null)
+            }
+        }
+        Command::Switch { group, node } => switch(&api, &runtime, group, node, audience).await,
+        Command::Control { .. } | Command::MergePath => unreachable!(),
+    }
+}
+
+fn emit_agent(result: Result<Value>) -> ExitCode {
+    match result {
+        Ok(value) => {
+            if value != Value::Null {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let payload = json!({"ok": false, "error": format!("{e:#}")});
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
-    // 管道下游提前关闭（例如 head）时按普通 Unix CLI 行为退出。
+async fn main() -> ExitCode {
+    // Restore normal Unix CLI behaviour when the pipe closes early (e.g. `head`).
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let mut cli = Cli::parse();
     if let Some(command) = cli.command.take() {
-        return execute(&cli, command, false).await;
+        return emit_agent(execute(&cli, command, Audience::Agent).await);
     }
-    ensure!(
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-        "请指定命令，运行 ninko --help 查看帮助"
-    );
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return emit_agent(Err(anyhow::anyhow!(
+            "no command given; run `ninko --help` for agent commands"
+        )));
+    }
+    if let Err(e) = human_menu(&cli).await {
+        eprintln!("\n  {} {e:#}\n", style("提示：").yellow());
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+async fn human_menu(cli: &Cli) -> Result<()> {
     println!(
         "\n  {}  {}",
         style("NINKO").cyan().bold(),
@@ -500,38 +952,76 @@ async fn main() -> Result<()> {
     println!("  {}\n", style("↑↓ 选择 · Enter 确定 · Esc 退出").dim());
     loop {
         let merge_footer = (|| -> Result<String> {
-            let dir = data_dir(&cli)?;
+            let dir = data_dir(cli)?;
             Ok(merge_path(&dir, &profiles(&dir)?)?.display().to_string())
         })()
         .unwrap_or_else(|e| format!("无法定位：{e}"));
         let items = [
-            "切换节点      搜索并切换当前策略组",
-            "查看订阅      完整节点列表与当前选择",
-            "退出",
-        ]
-        .map(str::to_owned);
+            "切换节点      搜索并切换当前策略组".to_owned(),
+            "查看订阅      完整节点列表与当前选择".to_owned(),
+            "Clash Verge    重启 / 退出应用".to_owned(),
+            "退出".to_owned(),
+        ];
         let selected =
             terminal::select("你想做什么？", &items, 0, false, Some(&merge_footer)).await?;
-        let command = match selected {
-            Some(0) => Command::Switch {
-                group: None,
-                node: None,
-            },
-            Some(1) => Command::List { json: false },
-            _ => return Ok(()),
-        };
-        let switching = matches!(command, Command::Switch { .. });
-        if let Err(e) = execute(&cli, command, true).await {
-            if switching {
-                // 切换失败提示同样只留在切换界面
-                terminal::show_result(&[format!("  {} {e:#}", style("提示：").yellow())])?;
-            } else {
-                eprintln!("\n  {} {e:#}\n", style("提示：").yellow());
+        match selected {
+            Some(0) => {
+                if let Err(e) = execute(
+                    cli,
+                    Command::Switch {
+                        group: None,
+                        node: None,
+                    },
+                    Audience::Human,
+                )
+                .await
+                {
+                    terminal::show_result(&[result_line(false, &format!("{e:#}"))])?;
+                }
             }
+            Some(1) => {
+                if let Err(e) = execute(cli, Command::List, Audience::Human).await {
+                    eprintln!("\n  {} {e:#}\n", style("提示：").yellow());
+                }
+                terminal::wait_key()?;
+            }
+            Some(2) => {
+                if let Err(e) = verge_control_menu(cli).await {
+                    terminal::show_result(&[result_line(false, &format!("{e:#}"))])?;
+                }
+            }
+            _ => return Ok(()),
         }
-        if !switching {
-            terminal::wait_key()?;
-        }
+    }
+}
+
+async fn verge_control_menu(cli: &Cli) -> Result<()> {
+    let items = [
+        "重启 Clash Verge    关闭后再启动应用".to_owned(),
+        "关闭 Clash Verge    退出应用（核心服务仍可运行）".to_owned(),
+        "返回".to_owned(),
+    ];
+    let selected = terminal::select("Clash Verge", &items, 0, false, None).await?;
+    match selected {
+        Some(0) => execute(
+            cli,
+            Command::Control {
+                action: ControlAction::Restart,
+            },
+            Audience::Human,
+        )
+        .await
+        .map(|_| ()),
+        Some(1) => execute(
+            cli,
+            Command::Control {
+                action: ControlAction::Stop,
+            },
+            Audience::Human,
+        )
+        .await
+        .map(|_| ()),
+        _ => Ok(()),
     }
 }
 
@@ -558,148 +1048,4 @@ fn print_nodes<'a>(nodes: impl Iterator<Item = &'a Node>, runtime: &Runtime) {
         ]);
     }
     println!("{rows}");
-}
-
-async fn execute(cli: &Cli, command: Command, interactive: bool) -> Result<()> {
-    if matches!(command, Command::MergePath) {
-        let dir = data_dir(cli)?;
-        println!("{}", merge_path(&dir, &profiles(&dir)?)?.display());
-        return Ok(());
-    }
-    let api = Api::new(cli)?;
-    let runtime = Runtime::read(&api).await?;
-    match command {
-        Command::List { json: as_json } => {
-            let metadata = profiles(&data_dir(cli)?)?;
-            let current = metadata
-                .items
-                .iter()
-                .find(|p| Some(&p.uid) == metadata.current.as_ref());
-            let groups: BTreeMap<_, _> = runtime
-                .proxies
-                .iter()
-                .filter(|(_, n)| n.all.is_some())
-                .collect();
-            let inline: Vec<_> = runtime
-                .proxies
-                .values()
-                .filter(|n| {
-                    testable(n)
-                        && !runtime
-                            .providers
-                            .values()
-                            .any(|p| p.proxies.iter().any(|pn| pn.name == n.name))
-                })
-                .collect();
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"current_profile": current, "providers": runtime.providers, "inline_nodes": inline, "groups": groups})
-                    )?
-                );
-            } else {
-                if let Some(p) = current {
-                    println!(
-                        "当前 Profile：{} [{}]",
-                        p.name.as_deref().unwrap_or(&p.uid),
-                        p.kind
-                    );
-                }
-                println!("\n  {}", style("当前策略组").cyan().bold());
-                let mut selections = table(&["策略组", "当前节点"]);
-                for (name, n) in &groups {
-                    selections.add_row([name.as_str(), n.now.as_deref().unwrap_or("无固定选择")]);
-                }
-                println!("{selections}");
-                for (name, p) in &runtime.providers {
-                    println!(
-                        "\n订阅：{name} [{}] — {} 个节点",
-                        p.vehicle_type,
-                        p.proxies.len()
-                    );
-                    print_nodes(p.proxies.iter(), &runtime);
-                }
-                if !inline.is_empty() {
-                    println!("\n运行配置内置节点：");
-                    print_nodes(inline.into_iter(), &runtime);
-                }
-            }
-        }
-        Command::Test {
-            provider,
-            group,
-            url,
-            timeout,
-            concurrency,
-            json: as_json,
-        } => {
-            let test_url = Url::parse(&url).context("测速 URL 无效")?;
-            ensure!(
-                matches!(test_url.scheme(), "http" | "https"),
-                "测速 URL 必须使用 HTTP/HTTPS"
-            );
-            let targets = runtime.targets(provider.as_deref(), group.as_deref())?;
-            ensure!(!targets.is_empty(), "没有可测速节点");
-            eprintln!(
-                "正在测试 {} 个节点，并发 {}，每个节点超时 {} ms…",
-                targets.len(),
-                concurrency,
-                timeout
-            );
-            let progress = if !as_json {
-                ProgressBar::new(targets.len() as u64)
-            } else {
-                ProgressBar::hidden()
-            };
-            progress.set_style(
-                ProgressStyle::with_template(
-                    "  {spinner:.cyan} [{bar:30.cyan/blue}] {pos}/{len} · {elapsed} · {msg}",
-                )?
-                .progress_chars("━━─"),
-            );
-            progress.enable_steady_tick(Duration::from_millis(100));
-            let mut results: Vec<_> = stream::iter(targets)
-                .map(|t| measure(&api, t, &url, timeout))
-                .buffer_unordered(concurrency as usize)
-                .inspect(|r| {
-                    progress.inc(1);
-                    progress.set_message(r.target.name.clone());
-                })
-                .collect()
-                .await;
-            progress.finish_and_clear();
-            results.sort_by_key(|r| r.delay_ms.unwrap_or(u64::MAX));
-            if as_json {
-                println!("{}", serde_json::to_string_pretty(&results)?);
-            } else {
-                let passed = results.iter().filter(|r| r.delay_ms.is_some()).count();
-                println!(
-                    "\n  {}  {} 可用 / {} 失败 · 延迟由低到高",
-                    style("测速完成").green().bold(),
-                    passed,
-                    results.len() - passed
-                );
-                let mut rows = table(&["延迟", "订阅", "节点", "状态"]);
-                for r in &results {
-                    rows.add_row([
-                        r.delay_ms.map(|d| format!("{d} ms")).unwrap_or("—".into()),
-                        r.target.provider.clone().unwrap_or("运行配置".into()),
-                        r.target.name.clone(),
-                        r.error.clone().unwrap_or("可用".into()),
-                    ]);
-                }
-                println!("{rows}");
-            }
-            ensure!(
-                results.iter().any(|r| r.delay_ms.is_some()),
-                "所有节点测速失败"
-            );
-        }
-        Command::Switch { group, node } => {
-            switch(&api, &runtime, group, node, interactive).await?
-        }
-        Command::MergePath => unreachable!(),
-    }
-    Ok(())
 }

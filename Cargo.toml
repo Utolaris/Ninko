@@ -1,6 +1,6 @@
 [package]
 name = "ninko"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "通过 Clash Verge 管理运行中的订阅、节点和全局扩展配置"
 license = "MIT"
