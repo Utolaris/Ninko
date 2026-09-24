@@ -16,6 +16,22 @@ Ninko 是一种会附身于人的狐灵，由于 Clash Verge 的 logo 是狐狸�
 
 **人类**：不带参数进入中文交互菜单。**Agent / LLM**：子命令输出 JSON，`ninko -h` 为英文。
 
+### Homebrew 安装
+
+macOS 与 Linux（Linuxbrew）均可。本仓库即 tap 源，formula 在 [`Formula/ninko.rb`](Formula/ninko.rb)，从源码构建（依赖 `rust`，brew 会自动装）。
+
+因仓库名是 `Ninko` 而非 `homebrew-ninko`，**必须写全 URL**；`brew tap Utolaris/Ninko` 会去找 `homebrew-Ninko`，会失败。
+
+```sh
+brew tap utolaris/ninko https://github.com/Utolaris/Ninko.git
+brew install ninko
+ninko --version   # ninko 1.0.0
+```
+
+已在 Kali Linux（Homebrew 7 / Linuxbrew）上实测：`brew tap` → `brew install` → `ninko --version` 通过。
+
+### 源码安装
+
 ```sh
 ./scripts/install.sh
 ninko # 交互菜单（中文）
