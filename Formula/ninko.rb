@@ -6,6 +6,12 @@ class Ninko < Formula
   license "MIT"
   head "https://github.com/Utolaris/Ninko.git", branch: "main"
 
+  bottle do
+    root_url "https://github.com/Utolaris/Ninko/releases/download/v1.0.0"
+    sha256 cellar: any, arm64_sequoia: "5d673f835986c5017c028bb25de81e03c6dc281d3990f27e27deb51c3f185a8c"
+    sha256 cellar: any, x86_64_linux:  "1997051548e7346e778e78ceea47afce5b2af123020e82cf52659df2632fe308"
+  end
+
   depends_on "rust" => :build
 
   def install
