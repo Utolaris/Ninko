@@ -112,19 +112,20 @@ jobs:
           brew install rust
           brew install --build-bottle "${TAP_USER}/${TAP_REPO}/${FORMULA}"
           brew test "${TAP_USER}/${TAP_REPO}/${FORMULA}"
-          mkdir -p bottles
+          # brew bottle writes into the current directory (no --output-dir).
           brew bottle \
             --json \
             --root-url="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}" \
-            --output-dir=bottles \
             "${TAP_USER}/${TAP_REPO}/${FORMULA}"
-          ls -la bottles
+          ls -la ./*.bottle*
 
       - name: Upload bottle artifacts
         uses: actions/upload-artifact@v4
         with:
           name: bottles-${{ matrix.os }}
-          path: bottles/*
+          path: |
+            *.bottle*.tar.gz
+            *.bottle*.json
 
   publish:
     name: Attach bottles and update formula
