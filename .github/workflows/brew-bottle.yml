@@ -101,6 +101,9 @@ jobs:
         id: set-up-homebrew
         uses: Homebrew/actions/setup-homebrew@main
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build and bottle
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -108,9 +111,9 @@ jobs:
         run: |
           set -euo pipefail
           brew tap "${TAP_USER}/${TAP_REPO}" "$GITHUB_WORKSPACE"
-          # Install rust first so the ninko dep edge cannot recurse during resolution.
-          brew install rust
-          brew install --build-bottle "${TAP_USER}/${TAP_REPO}/${FORMULA}"
+          brew trust --formula "${TAP_USER}/${TAP_REPO}/${FORMULA}"
+          # rustup already provides cargo; skip brew's rust build dependency.
+          brew install --build-bottle --ignore-dependencies "${TAP_USER}/${TAP_REPO}/${FORMULA}"
           brew test "${TAP_USER}/${TAP_REPO}/${FORMULA}"
           # brew bottle writes into the current directory (no --output-dir).
           brew bottle \
@@ -131,6 +134,10 @@ jobs:
     name: Attach bottles and update formula
     needs: bottle
     runs-on: ubuntu-latest
+    env:
+      TAP_USER: utolaris
+      TAP_REPO: ninko
+      FORMULA: ninko
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
