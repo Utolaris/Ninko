@@ -1,0 +1,226 @@
+name: Brew bottles
+
+# On each published release: build Homebrew bottles for macOS/Linux,
+# attach them to the release, and rewrite Formula/ninko.rb bottle block.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to bottle (e.g. v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  TAP_USER: utolaris
+  TAP_REPO: ninko
+  FORMULA: ninko
+
+jobs:
+  update-formula:
+    name: Point formula at release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Compute source checksum and rewrite formula
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          version="${tag#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          tarball="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          echo "Downloading ${tarball}"
+          curl -fsSL -o source.tar.gz "$tarball"
+          sha="$(sha256sum source.tar.gz | awk '{print $1}')"
+          echo "sha256=${sha}"
+
+          python3 - "$version" "$sha" "${{ github.repository }}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version, sha, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+          path = Path("Formula/ninko.rb")
+          text = path.read_text()
+          text = re.sub(
+              r'url "https://github\.com/[^/]+/[^/]+/archive/refs/tags/v[^"]+"',
+              f'url "https://github.com/{repo}/archive/refs/tags/v{version}.tar.gz"',
+              text,
+              count=1,
+          )
+          text = re.sub(r'sha256 "[0-9a-f]{64}"', f'sha256 "{sha}"', text, count=1)
+          # Drop any previous bottle block; publish job rewrites it after merge.
+          text = re.sub(r"\n  bottle do\n(?:.*\n)*?  end\n", "\n", text, count=1)
+          path.write_text(text)
+          print(path.read_text())
+          PY
+
+      - name: Upload formula
+        uses: actions/upload-artifact@v4
+        with:
+          name: formula
+          path: Formula/ninko.rb
+
+  bottle:
+    name: Bottle (${{ matrix.os }})
+    needs: update-formula
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - macos-14
+          - ubuntu-24.04
+          - ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install updated formula
+        uses: actions/download-artifact@v4
+        with:
+          name: formula
+          path: Formula
+
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@main
+
+      - name: Build and bottle
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          set -euo pipefail
+          brew tap "${TAP_USER}/${TAP_REPO}" "$GITHUB_WORKSPACE"
+          brew install --build-bottle "${TAP_USER}/${TAP_REPO}/${FORMULA}"
+          brew test "${TAP_USER}/${TAP_REPO}/${FORMULA}"
+          mkdir -p bottles
+          brew bottle \
+            --json \
+            --root-url="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}" \
+            --output-dir=bottles \
+            "${TAP_USER}/${TAP_REPO}/${FORMULA}"
+          ls -la bottles
+
+      - name: Upload bottle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottles-${{ matrix.os }}
+          path: bottles/*
+
+  publish:
+    name: Attach bottles and update formula
+    needs: bottle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          # Bump via GITHUB_TOKEN; swap to a PAT if main is branch-protected.
+          token: ${{ github.token }}
+
+      - name: Download formula
+        uses: actions/download-artifact@v4
+        with:
+          name: formula
+          path: Formula
+
+      - name: Download bottle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bottles
+          merge-multiple: true
+
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@main
+
+      - name: Merge bottle metadata into formula
+        env:
+          ROOT_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -la bottles
+          python3 - "$ROOT_URL" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          root_url = sys.argv[1]
+          formula = Path("Formula/ninko.rb")
+          text = formula.read_text()
+          text = re.sub(r"\n  bottle do\n(?:.*\n)*?  end\n", "\n", text, count=1)
+
+          tags = {}
+          cellar = None
+          for path in sorted(Path("bottles").glob("*.json")):
+              for payload in json.loads(path.read_text()).values():
+                  bottle = payload["bottle"]
+                  cellar = bottle.get("cellar") or cellar
+                  for tag, info in bottle["tags"].items():
+                      tags[tag] = info["sha256"]
+
+          if not tags:
+              raise SystemExit("no bottle tags found in bottles/*.json")
+
+          def sort_key(item):
+              tag = item[0]
+              return (tag.endswith("_linux"), tag)
+
+          cellar_cell = f"cellar: {cellar}, " if cellar else ""
+          lines = ["  bottle do", f'    root_url "{root_url}"']
+          width = max(len(t) for t in tags)
+          for tag, sha in sorted(tags.items(), key=sort_key):
+              pad = " " * (width - len(tag))
+              lines.append(f'    sha256 {cellar_cell}{tag}:{pad} "{sha}"')
+          lines.append("  end")
+          block = "\n".join(lines) + "\n"
+
+          for marker in ("\n  depends_on ", "\n  def install"):
+              idx = text.find(marker)
+              if idx != -1:
+                  text = text[:idx] + "\n" + block + text[idx:]
+                  break
+          else:
+              text = text.rstrip() + "\n" + block
+
+          formula.write_text(text)
+          print(text)
+          PY
+
+      - name: Upload bottles to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" bottles/*.bottle*.tar.gz --clobber \
+            --repo "${{ github.repository }}"
+
+      - name: Commit formula bottles
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ninko.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged"
+            exit 0
+          fi
+          git commit -m "ninko ${RELEASE_TAG#v}: attach Homebrew bottles"
+          git push origin HEAD:main
